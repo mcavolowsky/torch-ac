@@ -59,6 +59,8 @@ class BaseAlgo(ABC):
         self.preprocess_obss = preprocess_obss or default_preprocess_obss
         self.reshape_reward = reshape_reward
 
+        self.reward_size = self.acmodel.reward_size
+
         # Control parameters
 
         assert self.acmodel.recurrent or self.recurrence == 1
@@ -86,15 +88,15 @@ class BaseAlgo(ABC):
         self.mask = torch.ones(shape[1], device=self.device)
         self.masks = torch.zeros(*shape, device=self.device)
         self.actions = torch.zeros(*shape, device=self.device, dtype=torch.int)
-        self.values = torch.zeros(*shape, device=self.device)
-        self.rewards = torch.zeros(*shape, device=self.device)
-        self.advantages = torch.zeros(*shape, device=self.device)
+        self.values = torch.zeros(*shape, self.reward_size, device=self.device)
+        self.rewards = torch.zeros(*shape, self.reward_size, device=self.device)
+        self.advantages = torch.zeros(*shape, self.reward_size, device=self.device)
         self.log_probs = torch.zeros(*shape, device=self.device)
 
         # Initialize log values
 
-        self.log_episode_return = torch.zeros(self.num_procs, device=self.device)
-        self.log_episode_reshaped_return = torch.zeros(self.num_procs, device=self.device)
+        self.log_episode_return = torch.zeros(self.num_procs, self.reward_size, device=self.device)
+        self.log_episode_reshaped_return = torch.zeros(self.num_procs, self.reward_size, device=self.device)
         self.log_episode_num_frames = torch.zeros(self.num_procs, device=self.device)
 
         self.log_done_counter = 0
@@ -165,12 +167,12 @@ class BaseAlgo(ABC):
             for i, done_ in enumerate(done):
                 if done_:
                     self.log_done_counter += 1
-                    self.log_return.append(self.log_episode_return[i].item())
-                    self.log_reshaped_return.append(self.log_episode_reshaped_return[i].item())
+                    self.log_return.append(self.log_episode_return[i])#.item())
+                    self.log_reshaped_return.append(self.log_episode_reshaped_return[i])#.item())
                     self.log_num_frames.append(self.log_episode_num_frames[i].item())
 
-            self.log_episode_return *= self.mask
-            self.log_episode_reshaped_return *= self.mask
+            self.log_episode_return = (self.log_episode_return.T*self.mask).T
+            self.log_episode_reshaped_return = (self.log_episode_reshaped_return.T * self.mask).T
             self.log_episode_num_frames *= self.mask
 
         # Add advantage and return to experiences
@@ -185,10 +187,10 @@ class BaseAlgo(ABC):
         for i in reversed(range(self.num_frames_per_proc)):
             next_mask = self.masks[i+1] if i < self.num_frames_per_proc - 1 else self.mask
             next_value = self.values[i+1] if i < self.num_frames_per_proc - 1 else next_value
-            next_advantage = self.advantages[i+1] if i < self.num_frames_per_proc - 1 else 0
+            next_advantage = self.advantages[i+1] if i < self.num_frames_per_proc - 1 else torch.zeros_like(self.log_episode_return)
 
-            delta = self.rewards[i] + self.discount * next_value * next_mask - self.values[i]
-            self.advantages[i] = delta + self.discount * self.gae_lambda * next_advantage * next_mask
+            delta = self.rewards[i] +  (next_value.T * (self.discount * next_mask)).T - self.values[i]
+            self.advantages[i] = delta + (next_advantage.T * (self.discount * self.gae_lambda *  next_mask)).T
 
         # Define experiences:
         #   the whole experience is the concatenation of the experience
@@ -209,9 +211,9 @@ class BaseAlgo(ABC):
             exps.mask = self.masks.transpose(0, 1).reshape(-1).unsqueeze(1)
         # for all tensors below, T x P -> P x T -> P * T
         exps.action = self.actions.transpose(0, 1).reshape(-1)
-        exps.value = self.values.transpose(0, 1).reshape(-1)
-        exps.reward = self.rewards.transpose(0, 1).reshape(-1)
-        exps.advantage = self.advantages.transpose(0, 1).reshape(-1)
+        exps.value = self.values.transpose(0, 1).reshape(-1,self.reward_size)
+        exps.reward = self.rewards.transpose(0, 1).reshape(-1,self.reward_size)
+        exps.advantage = self.advantages.transpose(0, 1).reshape(-1,self.reward_size)
         exps.returnn = exps.value + exps.advantage
         exps.log_prob = self.log_probs.transpose(0, 1).reshape(-1)
 
