@@ -92,12 +92,13 @@ class MultiQAlgo(ABC):
 #        self.masks = torch.zeros(*shape, self.reward_size, device=self.device)
         self.actions = torch.zeros(*shape, device=self.device, dtype=torch.int)
         self.values = torch.zeros(*shape, self.env.action_space.n, self.reward_size, device=self.device)
+        self.expected_values = torch.zeros(*shape, self.reward_size, device=self.device)
         self.rewards = torch.zeros(*shape, self.reward_size, device=self.device)
         self.log_probs = torch.zeros(*shape, device=self.device)
 
         # initialize the pareto weights
 
-        self.weights = torch.zeros(*shape, self.reward_size, device=self.device)
+        self.weights = torch.ones(shape[1], self.reward_size, device=self.device)/self.reward_size
 
         # Initialize log values
 
@@ -198,9 +199,11 @@ class MultiQAlgo(ABC):
 
         for i in reversed(range(self.num_frames_per_proc)):
             next_mask = self.masks[i+1] if i < self.num_frames_per_proc - 1 else self.mask
+            next_mask = torch.vstack([next_mask] * 2).T
+
             next_value = self.values[i+1] if i < self.num_frames_per_proc - 1 else next_value
 
-            self.exp_values[i] = self.rewards[i] +  (self.pareto_rewards(next_value).T * (self.discount * next_mask)).T
+            self.expected_values[i] = self.rewards[i] +  (self.pareto_rewards(next_value,self.weights) * (self.discount * next_mask))
  #           self.advantages[i] = delta + (next_advantage.T * (self.discount * self.gae_lambda *  next_mask)).T
 
         # Define experiences:
@@ -224,7 +227,7 @@ class MultiQAlgo(ABC):
         exps.action = self.actions.transpose(0, 1).reshape(-1)
         exps.value = self.values.transpose(0, 1).reshape(-1,self.reward_size)
         exps.reward = self.rewards.transpose(0, 1).reshape(-1,self.reward_size)
-        exps.exp_value = self.exp_values.transpose(0, 1).reshape(-1,self.reward_size)
+        exps.exp_value = self.expected_values.transpose(0, 1).reshape(-1,self.reward_size)
         exps.log_prob = self.log_probs.transpose(0, 1).reshape(-1)
 
         # Preprocess experiences
@@ -283,24 +286,15 @@ class MultiQAlgo(ABC):
 
 #            policy_loss = -(dist.log_prob(sb.action) * sb.advantage).mean()
 
-            value_loss = (value - sb.returnn).pow(2).mean()
-
-            loss = policy_loss - self.entropy_coef * entropy + self.value_loss_coef * value_loss
+            loss = (value - sb.exp_value.unsqueeze(1)).pow(2).mean()
 
             # Update batch values
 
-            update_entropy += entropy.item()
-            update_value += value.mean().item()
-            update_policy_loss += policy_loss.item()
-            update_value_loss += value_loss.item()
             update_loss += loss
 
         # Update update values
 
-        update_entropy /= self.recurrence
         update_value /= self.recurrence
-        update_policy_loss /= self.recurrence
-        update_value_loss /= self.recurrence
         update_loss /= self.recurrence
 
         # Update actor-critic
@@ -308,7 +302,7 @@ class MultiQAlgo(ABC):
         self.optimizer.zero_grad()
         update_loss.backward()
         update_grad_norm = sum(p.grad.data.norm(2) ** 2 for p in self.model.parameters()) ** 0.5
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+#        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
         self.optimizer.step()
 
         # Log some values
@@ -341,10 +335,17 @@ class MultiQAlgo(ABC):
         return starting_indexes
 
     def pareto_action(self, values, weights):
-        col = torch.randint(0,self.reward_size,(1,))
-        return torch.max(values[:,:,col], dim=1).indices.squeeze()
+        #col = torch.randint(0,self.reward_size,(1,))
+        #return torch.max(values[:,:,col], dim=1).indices.squeeze()
 
-    def pareto_rewards(self, values):
-        col = torch.randint(0,self.reward_size,(1,))
-        inds = torch.max(values[:,:,col], dim=1).indices
-        return values.gather(inds)
+        return torch.tensor(
+                [torch.argmax(torch.matmul(values[i,:,:],weights[i,:]))
+                 for i in range(values.shape[0])])
+
+    def pareto_rewards(self, values, weights):
+        #col = torch.randint(0,self.reward_size,(1,))
+        #inds = torch.max(values[:,:,col], dim=1).indices
+        #return values.gather(inds)
+
+        actions = self.pareto_action(values, weights)
+        return torch.vstack([values[i,actions[i],:] for i in range(values.shape[0])])
