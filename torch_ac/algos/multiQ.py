@@ -4,10 +4,12 @@ import torch
 from torch_ac.format import default_preprocess_obss
 from torch_ac.utils import DictList, ParallelEnv
 
+import numpy as np
+
 class MultiQAlgo(ABC):
     """The base class for RL algorithms."""
 
-    def __init__(self, envs, acmodel, device=None, num_frames_per_proc=None, discount=0.99, lr=0.001,
+    def __init__(self, envs, model, device=None, num_frames_per_proc=None, discount=0.99, lr=0.001,
                  recurrence=4,
                  adam_eps=1e-8,
                  preprocess_obss=None, reshape_reward=None):
@@ -50,7 +52,7 @@ class MultiQAlgo(ABC):
         num_frames_per_proc = num_frames_per_proc or 8  # is 8 correct here?
 
         self.env = ParallelEnv(envs)
-        self.acmodel = acmodel
+        self.model = model
         self.device = device
         self.num_frames_per_proc = num_frames_per_proc
         self.discount = discount
@@ -59,17 +61,17 @@ class MultiQAlgo(ABC):
         self.preprocess_obss = preprocess_obss or default_preprocess_obss
         self.reshape_reward = reshape_reward
 
-        self.reward_size = self.acmodel.reward_size
+        self.reward_size = self.model.reward_size
 
         # Control parameters
 
-        assert self.acmodel.recurrent or self.recurrence == 1
+        assert self.model.recurrent or self.recurrence == 1
         assert self.num_frames_per_proc % self.recurrence == 0
 
         # Configure acmodel
 
-        self.acmodel.to(self.device)
-        self.acmodel.train()
+        self.model.to(self.device)
+        self.model.train()
 
         # Store helpers values
 
@@ -82,16 +84,20 @@ class MultiQAlgo(ABC):
 
         self.obs = self.env.reset()
         self.obss = [None]*(shape[0])
-        if self.acmodel.recurrent:
-            self.memory = torch.zeros(shape[1], self.acmodel.memory_size, device=self.device)
-            self.memories = torch.zeros(*shape, self.acmodel.memory_size, device=self.device)
+        if self.model.recurrent:
+            self.memory = torch.zeros(shape[1], self.model.memory_size, device=self.device)
+            self.memories = torch.zeros(*shape, self.model.memory_size, device=self.device)
         self.mask = torch.ones(shape[1], device=self.device)
         self.masks = torch.zeros(*shape, device=self.device)
+#        self.masks = torch.zeros(*shape, self.reward_size, device=self.device)
         self.actions = torch.zeros(*shape, device=self.device, dtype=torch.int)
-        self.values = torch.zeros(*shape, self.reward_size, device=self.device)
+        self.values = torch.zeros(*shape, self.env.action_space.n, self.reward_size, device=self.device)
         self.rewards = torch.zeros(*shape, self.reward_size, device=self.device)
-        self.advantages = torch.zeros(*shape, self.reward_size, device=self.device)
         self.log_probs = torch.zeros(*shape, device=self.device)
+
+        # initialize the pareto weights
+
+        self.weights = torch.zeros(*shape, self.reward_size, device=self.device)
 
         # Initialize log values
 
@@ -104,7 +110,7 @@ class MultiQAlgo(ABC):
         self.log_reshaped_return = [0] * self.num_procs
         self.log_num_frames = [0] * self.num_procs
 
-        self.optimizer = torch.optim.Adam(self.acmodel.parameters(), lr, eps=adam_eps)
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr, eps=adam_eps)
 
     def collect_experiences(self):
         """Collects rollouts and computes advantages.
@@ -132,11 +138,11 @@ class MultiQAlgo(ABC):
 
             preprocessed_obs = self.preprocess_obss(self.obs, device=self.device)
             with torch.no_grad():
-                if self.acmodel.recurrent:
-                    value, memory = self.acmodel(preprocessed_obs, self.memory * self.mask.unsqueeze(1))
+                if self.model.recurrent:
+                    value, memory = self.model(preprocessed_obs, self.memory * self.mask.unsqueeze(1))
                 else:
-                    value = self.acmodel(preprocessed_obs)
-            action = self.select_action(value)
+                    value = self.model(preprocessed_obs)
+            action = self.pareto_action(value, self.weights)
 
             obs, reward, done, _ = self.env.step(action.cpu().numpy())
 
@@ -144,7 +150,7 @@ class MultiQAlgo(ABC):
 
             self.obss[i] = self.obs
             self.obs = obs
-            if self.acmodel.recurrent:
+            if self.model.recurrent:
                 self.memories[i] = self.memory
                 self.memory = memory
             self.masks[i] = self.mask
@@ -158,7 +164,7 @@ class MultiQAlgo(ABC):
                 ], device=self.device)
             else:
                 self.rewards[i] = torch.tensor(reward, device=self.device)
-            self.log_probs[i] = dist.log_prob(action)
+
 
             # Update log values
 
@@ -173,6 +179,10 @@ class MultiQAlgo(ABC):
                     self.log_reshaped_return.append(self.log_episode_reshaped_return[i])#.item())
                     self.log_num_frames.append(self.log_episode_num_frames[i].item())
 
+                    # reroll the weights for that episode
+                    self.weights[i,0] = torch.rand(1)
+                    self.weights[i,1] = 1-self.weights[i,0]
+
             self.log_episode_return = (self.log_episode_return.T*self.mask).T
             self.log_episode_reshaped_return = (self.log_episode_reshaped_return.T * self.mask).T
             self.log_episode_num_frames *= self.mask
@@ -181,18 +191,17 @@ class MultiQAlgo(ABC):
 
         preprocessed_obs = self.preprocess_obss(self.obs, device=self.device)
         with torch.no_grad():
-            if self.acmodel.recurrent:
-                _, next_value, _ = self.acmodel(preprocessed_obs, self.memory * self.mask.unsqueeze(1))
+            if self.model.recurrent:
+                next_value, _ = self.model(preprocessed_obs, self.memory * self.mask.unsqueeze(1))
             else:
-                _, next_value = self.acmodel(preprocessed_obs)
+                next_value = self.model(preprocessed_obs)
 
         for i in reversed(range(self.num_frames_per_proc)):
             next_mask = self.masks[i+1] if i < self.num_frames_per_proc - 1 else self.mask
             next_value = self.values[i+1] if i < self.num_frames_per_proc - 1 else next_value
-            next_advantage = self.advantages[i+1] if i < self.num_frames_per_proc - 1 else torch.zeros_like(self.log_episode_return)
 
-            delta = self.rewards[i] +  (next_value.T * (self.discount * next_mask)).T - self.values[i]
-            self.advantages[i] = delta + (next_advantage.T * (self.discount * self.gae_lambda *  next_mask)).T
+            self.exp_values[i] = self.rewards[i] +  (self.pareto_rewards(next_value).T * (self.discount * next_mask)).T
+ #           self.advantages[i] = delta + (next_advantage.T * (self.discount * self.gae_lambda *  next_mask)).T
 
         # Define experiences:
         #   the whole experience is the concatenation of the experience
@@ -206,7 +215,7 @@ class MultiQAlgo(ABC):
         exps.obs = [self.obss[i][j]
                     for j in range(self.num_procs)
                     for i in range(self.num_frames_per_proc)]
-        if self.acmodel.recurrent:
+        if self.model.recurrent:
             # T x P x D -> P x T x D -> (P * T) x D
             exps.memory = self.memories.transpose(0, 1).reshape(-1, *self.memories.shape[2:])
             # T x P -> P x T -> (P * T) x 1
@@ -215,8 +224,7 @@ class MultiQAlgo(ABC):
         exps.action = self.actions.transpose(0, 1).reshape(-1)
         exps.value = self.values.transpose(0, 1).reshape(-1,self.reward_size)
         exps.reward = self.rewards.transpose(0, 1).reshape(-1,self.reward_size)
-        exps.advantage = self.advantages.transpose(0, 1).reshape(-1,self.reward_size)
-        exps.returnn = exps.value + exps.advantage
+        exps.exp_value = self.exp_values.transpose(0, 1).reshape(-1,self.reward_size)
         exps.log_prob = self.log_probs.transpose(0, 1).reshape(-1)
 
         # Preprocess experiences
@@ -256,7 +264,7 @@ class MultiQAlgo(ABC):
 
         # Initialize memory
 
-        if self.acmodel.recurrent:
+        if self.model.recurrent:
             memory = exps.memory[inds]
 
         for i in range(self.recurrence):
@@ -266,14 +274,14 @@ class MultiQAlgo(ABC):
 
             # Compute loss
 
-            if self.acmodel.recurrent:
-                dist, value, memory = self.acmodel(sb.obs, memory * sb.mask)
+            if self.model.recurrent:
+                value, memory = self.model(sb.obs, memory * sb.mask)
             else:
-                dist, value = self.acmodel(sb.obs)
+                value = self.model(sb.obs)
 
-            entropy = dist.entropy().mean()
+#            entropy = dist.entropy().mean()
 
-            policy_loss = -(dist.log_prob(sb.action) * sb.advantage).mean()
+#            policy_loss = -(dist.log_prob(sb.action) * sb.advantage).mean()
 
             value_loss = (value - sb.returnn).pow(2).mean()
 
@@ -299,8 +307,8 @@ class MultiQAlgo(ABC):
 
         self.optimizer.zero_grad()
         update_loss.backward()
-        update_grad_norm = sum(p.grad.data.norm(2) ** 2 for p in self.acmodel.parameters()) ** 0.5
-        torch.nn.utils.clip_grad_norm_(self.acmodel.parameters(), self.max_grad_norm)
+        update_grad_norm = sum(p.grad.data.norm(2) ** 2 for p in self.model.parameters()) ** 0.5
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
         self.optimizer.step()
 
         # Log some values
@@ -329,9 +337,14 @@ class MultiQAlgo(ABC):
             the indexes of the experiences to be used at first
         """
 
-        starting_indexes = numpy.arange(0, self.num_frames, self.recurrence)
+        starting_indexes = np.arange(0, self.num_frames, self.recurrence)
         return starting_indexes
 
-    def select_action(self, values):
-        ind = torch.randint(0,self.reward_size,(1,))
-        return torch.argmax(values[:,:,ind], dim=1)
+    def pareto_action(self, values, weights):
+        col = torch.randint(0,self.reward_size,(1,))
+        return torch.max(values[:,:,col], dim=1).indices.squeeze()
+
+    def pareto_rewards(self, values):
+        col = torch.randint(0,self.reward_size,(1,))
+        inds = torch.max(values[:,:,col], dim=1).indices
+        return values.gather(inds)
