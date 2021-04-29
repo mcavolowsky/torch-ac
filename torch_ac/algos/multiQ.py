@@ -49,7 +49,7 @@ class MultiQAlgo(ABC):
 
         # Store parameters
 
-        num_frames_per_proc = num_frames_per_proc or 8  # is 8 correct here?
+        num_frames_per_proc = num_frames_per_proc or 128  # is 128 correct here?
 
         self.env = ParallelEnv(envs)
         self.model = model
@@ -111,6 +111,8 @@ class MultiQAlgo(ABC):
         self.log_reshaped_return = [0] * self.num_procs
         self.log_num_frames = [0] * self.num_procs
 
+        self.eps = 0.05
+
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr, eps=adam_eps)
 
     def collect_experiences(self):
@@ -144,6 +146,8 @@ class MultiQAlgo(ABC):
                 else:
                     value = self.model(preprocessed_obs)
             action = self.pareto_action(value, self.weights)
+            eps_mask = torch.rand(action.shape)<self.eps
+            action[eps_mask] = torch.randint(0,self.env.action_space.n,(sum(eps_mask),))
 
             obs, reward, done, _ = self.env.step(action.cpu().numpy())
 
@@ -181,8 +185,13 @@ class MultiQAlgo(ABC):
                     self.log_num_frames.append(self.log_episode_num_frames[i].item())
 
                     # reroll the weights for that episode
-                    self.weights[i,0] = torch.rand(1)
-                    self.weights[i,1] = 1-self.weights[i,0]
+                    if self.reward_size == 1:
+                        self.weights[i,0] = 1
+                    elif self.reward_size == 2:
+                        self.weights[i,0] = torch.rand(1)
+                        self.weights[i,1] = 1-self.weights[i,0]
+                    else:
+                        raise NotImplementedError
 
             self.log_episode_return = (self.log_episode_return.T*self.mask).T
             self.log_episode_reshaped_return = (self.log_episode_reshaped_return.T * self.mask).T
@@ -196,14 +205,15 @@ class MultiQAlgo(ABC):
                 next_value, _ = self.model(preprocessed_obs, self.memory * self.mask.unsqueeze(1))
             else:
                 next_value = self.model(preprocessed_obs)
+            next_value_clipped = torch.clip(next_value, *self.env.envs[0].reward_range)
 
         for i in reversed(range(self.num_frames_per_proc)):
             next_mask = self.masks[i+1] if i < self.num_frames_per_proc - 1 else self.mask
-            next_mask = torch.vstack([next_mask] * 2).T
+            next_mask = torch.vstack([next_mask] * self.reward_size).T
 
             next_value = self.values[i+1] if i < self.num_frames_per_proc - 1 else next_value
 
-            self.expected_values[i] = self.rewards[i] +  (self.pareto_rewards(next_value,self.weights) * (self.discount * next_mask))
+            self.expected_values[i] = self.rewards[i] +  (self.pareto_rewards(next_value_clipped,self.weights) * (self.discount * next_mask))
  #           self.advantages[i] = delta + (next_advantage.T * (self.discount * self.gae_lambda *  next_mask)).T
 
         # Define experiences:
