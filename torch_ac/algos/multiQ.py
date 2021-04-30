@@ -6,6 +6,8 @@ from torch_ac.utils import DictList, ParallelEnv
 
 import numpy as np
 
+from copy import deepcopy
+
 class MultiQAlgo(ABC):
     """The base class for RL algorithms."""
 
@@ -53,6 +55,7 @@ class MultiQAlgo(ABC):
 
         self.env = ParallelEnv(envs)
         self.model = model
+        self.eval_model = deepcopy(model)
         self.device = device
         self.num_frames_per_proc = num_frames_per_proc
         self.discount = discount
@@ -113,8 +116,9 @@ class MultiQAlgo(ABC):
 
         self.eps = 0.05
 
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr, eps=adam_eps)
-
+        #self.optimizer = torch.optim.Adam(self.model.parameters(), lr, eps=adam_eps)
+        self.optimizer = torch.optim.RMSprop(params=self.model.parameters(),
+                                       lr=self.lr)
     def collect_experiences(self):
         """Collects rollouts and computes advantages.
 
@@ -202,9 +206,9 @@ class MultiQAlgo(ABC):
         preprocessed_obs = self.preprocess_obss(self.obs, device=self.device)
         with torch.no_grad():
             if self.model.recurrent:
-                next_value, _ = self.model(preprocessed_obs, self.memory * self.mask.unsqueeze(1))
+                next_value, _ = self.eval_model(preprocessed_obs, self.memory * self.mask.unsqueeze(1))
             else:
-                next_value = self.model(preprocessed_obs)
+                next_value = self.eval_model(preprocessed_obs)
             next_value_clipped = torch.clip(next_value, *self.env.envs[0].reward_range)
 
         for i in reversed(range(self.num_frames_per_proc)):
@@ -347,7 +351,7 @@ class MultiQAlgo(ABC):
     def pareto_action(self, values, weights):
         #col = torch.randint(0,self.reward_size,(1,))
         #return torch.max(values[:,:,col], dim=1).indices.squeeze()
-
+        #print(torch.tensor([torch.argmax(torch.matmul(values[i,:,:],weights[i,:])) for i in range(values.shape[0])]))
         return torch.tensor(
                 [torch.argmax(torch.matmul(values[i,:,:],weights[i,:]))
                  for i in range(values.shape[0])])
