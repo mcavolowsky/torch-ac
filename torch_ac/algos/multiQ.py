@@ -201,8 +201,6 @@ class MultiQAlgo(ABC):
             self.log_episode_reshaped_return = (self.log_episode_reshaped_return.T * self.mask).T
             self.log_episode_num_frames *= self.mask
 
-        # Add advantage and return to experiences
-
         preprocessed_obs = self.preprocess_obss(self.obs, device=self.device)
         with torch.no_grad():
             if self.model.recurrent:
