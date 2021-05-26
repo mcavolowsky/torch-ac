@@ -14,6 +14,7 @@ class MultiQAlgo(ABC):
     def __init__(self, envs, model, device=None, num_frames_per_proc=None, discount=0.99, lr=0.001,
                  recurrence=4,
                  adam_eps=1e-8,
+                 buffer_size=10000,
                  preprocess_obss=None, reshape_reward=None):
         """
         Initializes a `BaseAlgo` instance.
@@ -114,12 +115,50 @@ class MultiQAlgo(ABC):
         self.log_reshaped_return = [0] * self.num_procs
         self.log_num_frames = [0] * self.num_procs
 
+        self.buffer = ReplayBuffer(capacity=buffer_size)
+
         self.eps = 0.05
 
         #self.optimizer = torch.optim.Adam(self.model.parameters(), lr, eps=adam_eps)
         self.optimizer = torch.optim.RMSprop(params=self.model.parameters(),
                                        lr=self.lr)
+
+
     def collect_experiences(self):
+        for n in range(self.num_frames_per_proc):
+            # calculate the prediction based on current state/obs
+            preprocessed_obs = self.preprocess_obss(self.obs, device=self.device)
+            with torch.no_grad():
+                if self.model.recurrent:
+                    q_value, memory = self.model(preprocessed_obs, self.memory * self.mask.unsqueeze(1))
+                else:
+                    q_value = self.model(preprocessed_obs)
+
+            # select an action based on the q-values
+            action = self.pareto_action(q_value, self.weights)
+            # overwrite the action based on epsilon
+            eps_mask = torch.rand(action.shape)<self.eps
+            action[eps_mask] = torch.randint(0,self.env.action_space.n,(sum(eps_mask),))
+
+            # step the environment based on the predicted action
+            next_obs, reward, done, _ = self.env.step(action.cpu().numpy())
+
+            next_preprocessed_obs = self.preprocess_obss(next_obs, device=self.device)
+            with torch.no_grad():
+                if self.model.recurrent:
+                    next_q, next_memory = self.model(preprocessed_obs, self.memory * self.mask.unsqueeze(1))
+                else:
+                    next_q = self.model(preprocessed_obs)
+
+
+        return exps, logs
+
+    def update_parameters(self, exps):
+        self.buffer.push(exps)
+
+        return logs
+
+    def collect_experiences_old(self):
         """Collects rollouts and computes advantages.
 
         Runs several environments concurrently. The next actions are computed
@@ -264,7 +303,7 @@ class MultiQAlgo(ABC):
 
         return exps, logs
 
-    def update_parameters(self, exps):
+    def update_parameters_old(self, exps):
         # Compute starting indexes
 
         inds = self._get_starting_indexes()
@@ -361,3 +400,23 @@ class MultiQAlgo(ABC):
 
         actions = self.pareto_action(values, weights)
         return torch.vstack([values[i,actions[i],:] for i in range(values.shape[0])])
+
+class ReplayBuffer(object):
+
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.buffer = []
+        self.position = 0
+
+    def push(self, *args):
+        """Saves a transition."""
+        if len(self.buffer) < self.capacity:
+            self.buffer.append(None)
+        self.buffer[self.position] = Transition(*args)
+        self.position = (self.position + 1) % self.capacity
+
+    def sample(self, batch_size):
+        return random.sample(self.memory, batch_size)
+
+    def __len__(self):
+        return len(self.buffer)
