@@ -9,6 +9,23 @@ from torch_ac.algos.base import BaseAlgo
 from torch_ac.algos.ppo import PPOAlgo
 
 class WeightedPPOAlgo(PPOAlgo):
+    def __init__(self, envs, acmodel, device=None, num_frames_per_proc=None, discount=0.99, lr=0.001, gae_lambda=0.95,
+                 entropy_coef=0.01, value_loss_coef=0.5, max_grad_norm=0.5, recurrence=4,
+                 adam_eps=1e-8, clip_eps=0.2, epochs=4, batch_size=256, preprocess_obss=None,
+                 reshape_reward=None):
+
+        super().__init__(envs, acmodel, device, num_frames_per_proc, discount, lr, gae_lambda,
+                 entropy_coef, value_loss_coef, max_grad_norm, recurrence,
+                 adam_eps, clip_eps, epochs, batch_size, preprocess_obss,
+                 reshape_reward)
+
+        self.reward_size = self.env.envs[0].reward_size
+        self.multi_values = torch.zeros(self.num_frames_per_proc, self.num_procs, self.reward_size,
+                                        device=self.device)
+        self.log_episode_reshaped_return = torch.zeros(self.num_procs, self.reward_size, device=self.device)
+
+
+
     def collect_experiences(self):
         """Collects rollouts and computes advantages.
         Runs several environments concurrently. The next actions are computed
@@ -34,9 +51,10 @@ class WeightedPPOAlgo(PPOAlgo):
             preprocessed_obs = self.preprocess_obss(self.obs, device=self.device)
             with torch.no_grad():
                 if self.acmodel.recurrent:
-                    dist, value, memory = self.acmodel(preprocessed_obs, self.memory * self.mask.unsqueeze(1))
+                    dist, value, multi_value, memory = self.acmodel(preprocessed_obs, self.memory * self.mask.unsqueeze(1),
+                                                                    return_multi=True)
                 else:
-                    dist, value = self.acmodel(preprocessed_obs)
+                    dist, value, multi_value = self.acmodel(preprocessed_obs, return_multi=True)
             action = dist.sample()
 
             obs, reward, done, _ = self.env.step(action.cpu().numpy())
@@ -68,18 +86,18 @@ class WeightedPPOAlgo(PPOAlgo):
 #            self.log_episode_return += torch.tensor(reward, device=self.device, dtype=torch.float)
             self.log_episode_return += torch.matmul(torch.tensor(reward, device=self.device, dtype=torch.float),
                                            self.acmodel.weights[self.acmodel.current_weight])
-            self.log_episode_reshaped_return += self.rewards[i]
+            self.log_episode_reshaped_return += torch.tensor(reward, device=self.device, dtype=torch.float)
             self.log_episode_num_frames += torch.ones(self.num_procs, device=self.device)
 
             for i, done_ in enumerate(done):
                 if done_:
                     self.log_done_counter += 1
                     self.log_return.append(self.log_episode_return[i].item())
-                    self.log_reshaped_return.append(self.log_episode_reshaped_return[i].item())
+                    self.log_reshaped_return.append(self.log_episode_reshaped_return[i,:])
                     self.log_num_frames.append(self.log_episode_num_frames[i].item())
 
             self.log_episode_return *= self.mask
-            self.log_episode_reshaped_return *= self.mask
+            self.log_episode_reshaped_return *= torch.vstack([self.mask]*self.reward_size).T
             self.log_episode_num_frames *= self.mask
 
         # Add advantage and return to experiences
@@ -87,16 +105,18 @@ class WeightedPPOAlgo(PPOAlgo):
         preprocessed_obs = self.preprocess_obss(self.obs, device=self.device)
         with torch.no_grad():
             if self.acmodel.recurrent:
-                _, next_value, _ = self.acmodel(preprocessed_obs, self.memory * self.mask.unsqueeze(1))
+                _, next_value, next_multi_value, _ = self.acmodel(preprocessed_obs, self.memory * self.mask.unsqueeze(1),
+                                                                  return_multi=True)
             else:
-                _, next_value = self.acmodel(preprocessed_obs)
+                _, next_value, next_multi_value = self.acmodel(preprocessed_obs, return_multi=True)
 
         for i in reversed(range(self.num_frames_per_proc)):
             next_mask = self.masks[i+1] if i < self.num_frames_per_proc - 1 else self.mask
             next_value = self.values[i+1] if i < self.num_frames_per_proc - 1 else next_value
             next_advantage = self.advantages[i+1] if i < self.num_frames_per_proc - 1 else 0
 
-            delta = self.rewards[i] + self.discount * next_value * next_mask - self.values[i]
+            delta = self.rewards[i] + self.discount * next_value * next_mask - self.values[i] \
+                    + torch.linalg.norm(self.discount * next_multi_value * torch.vstack([next_mask]*self.reward_size).T - self.multi_values[i], ord=1)
             self.advantages[i] = delta + self.discount * self.gae_lambda * next_advantage * next_mask
 
         # Define experiences:
