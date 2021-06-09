@@ -22,6 +22,9 @@ class WeightedPPOAlgo(PPOAlgo):
         self.reward_size = self.env.envs[0].reward_size
         self.multi_values = torch.zeros(self.num_frames_per_proc, self.num_procs, self.reward_size,
                                         device=self.device)
+        self.multi_rewards = torch.zeros(self.num_frames_per_proc, self.num_procs, self.reward_size,
+                                        device=self.device)
+
         self.log_episode_reshaped_return = torch.zeros(self.num_procs, self.reward_size, device=self.device)
 
 
@@ -76,9 +79,9 @@ class WeightedPPOAlgo(PPOAlgo):
                     for obs_, action_, reward_, done_ in zip(obs, action, reward, done)
                 ], device=self.device)
             else:
-#                self.rewards[i] = torch.tensor(reward, device=self.device)
-                 self.rewards[i] = torch.matmul(torch.tensor(reward, device=self.device, dtype=torch.float),
-                             self.acmodel.weights[self.acmodel.current_weight])
+                 self.multi_rewards[i] = torch.tensor(reward, device=self.device, dtype=torch.float)
+                 self.rewards[i] = torch.matmul(self.multi_rewards[i],
+                                     self.acmodel.weights[self.acmodel.current_weight])
             self.log_probs[i] = dist.log_prob(action)
 
             # Update log values
@@ -116,7 +119,7 @@ class WeightedPPOAlgo(PPOAlgo):
             next_advantage = self.advantages[i+1] if i < self.num_frames_per_proc - 1 else 0
 
             delta = self.rewards[i] + self.discount * next_value * next_mask - self.values[i] \
-                    + torch.linalg.norm(self.discount * next_multi_value * torch.vstack([next_mask]*self.reward_size).T - self.multi_values[i], ord=1)
+                    + 0*torch.linalg.norm(self.multi_rewards[i] + self.discount * next_multi_value * torch.vstack([next_mask]*self.reward_size).T - self.multi_values[i], ord=1, dim=1)
             self.advantages[i] = delta + self.discount * self.gae_lambda * next_advantage * next_mask
 
         # Define experiences:
@@ -140,6 +143,8 @@ class WeightedPPOAlgo(PPOAlgo):
         exps.action = self.actions.transpose(0, 1).reshape(-1)
         exps.value = self.values.transpose(0, 1).reshape(-1)
         exps.reward = self.rewards.transpose(0, 1).reshape(-1)
+        exps.multi_value = self.multi_values.transpose(0, 1).reshape(-1, self.reward_size)
+        exps.multi_reward = self.multi_rewards.transpose(0, 1).reshape(-1, self.reward_size)
         exps.advantage = self.advantages.transpose(0, 1).reshape(-1)
         exps.returnn = exps.value + exps.advantage
         exps.log_prob = self.log_probs.transpose(0, 1).reshape(-1)
@@ -165,3 +170,106 @@ class WeightedPPOAlgo(PPOAlgo):
         self.log_num_frames = self.log_num_frames[-self.num_procs:]
 
         return exps, logs
+
+    def update_parameters(self, exps):
+        # Collect experiences
+
+        for _ in range(self.epochs):
+            # Initialize log values
+
+            log_entropies = []
+            log_values = []
+            log_policy_losses = []
+            log_value_losses = []
+            log_grad_norms = []
+
+            for inds in self._get_batches_starting_indexes():
+                # Initialize batch values
+
+                batch_entropy = 0
+                batch_value = 0
+                batch_policy_loss = 0
+                batch_value_loss = 0
+                batch_loss = 0
+
+                # Initialize memory
+
+                if self.acmodel.recurrent:
+                    memory = exps.memory[inds]
+
+                for i in range(self.recurrence):
+                    # Create a sub-batch of experience
+
+                    sb = exps[inds + i]
+
+                    # Compute loss
+
+                    if self.acmodel.recurrent:
+                        dist, value, memory = self.acmodel(sb.obs, memory * sb.mask)
+                    else:
+                        dist, value = self.acmodel(sb.obs)
+
+                    entropy = dist.entropy().mean()
+
+                    ratio = torch.exp(dist.log_prob(sb.action) - sb.log_prob)
+                    surr1 = (sb.advantage.T * ratio).T
+                    surr2 = (sb.advantage.T * torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) ).T
+                    policy_loss = -torch.min(surr1, surr2).mean()
+
+                    value_clipped = sb.value + torch.clamp(value - sb.value, -self.clip_eps, self.clip_eps)
+                    surr1 = (value - sb.returnn).pow(2)
+                    surr2 = (value_clipped - sb.returnn).pow(2)
+                    value_loss = torch.max(surr1, surr2).mean()
+
+                    loss = policy_loss - self.entropy_coef * entropy + self.value_loss_coef * value_loss
+
+                    # Update batch values
+
+                    batch_entropy += entropy.item()
+                    batch_value += value.mean().item()
+                    batch_policy_loss += policy_loss.item()
+                    batch_value_loss += value_loss.item()
+                    batch_loss += loss
+
+                    # Update memories for next epoch
+
+                    if self.acmodel.recurrent and i < self.recurrence - 1:
+                        exps.memory[inds + i + 1] = memory.detach()
+
+                # Update batch values
+
+                batch_entropy /= self.recurrence
+                batch_value /= self.recurrence
+                batch_policy_loss /= self.recurrence
+                batch_value_loss /= self.recurrence
+                batch_loss /= self.recurrence
+
+                # Update actor-critic
+
+                self.optimizer.zero_grad()
+                batch_loss.backward()
+                grad_norm = sum(p.grad.data.norm(2).item() ** 2
+                                for p in self.acmodel.parameters()
+                                if not p.grad is None) ** 0.5
+                torch.nn.utils.clip_grad_norm_(self.acmodel.parameters(), self.max_grad_norm)
+                self.optimizer.step()
+
+                # Update log values
+
+                log_entropies.append(batch_entropy)
+                log_values.append(batch_value)
+                log_policy_losses.append(batch_policy_loss)
+                log_value_losses.append(batch_value_loss)
+                log_grad_norms.append(grad_norm)
+
+        # Log some values
+
+        logs = {
+            "entropy": numpy.mean(log_entropies),
+            "value": numpy.mean(log_values),
+            "policy_loss": numpy.mean(log_policy_losses),
+            "value_loss": numpy.mean(log_value_losses),
+            "grad_norm": numpy.mean(log_grad_norms)
+        }
+
+        return logs
