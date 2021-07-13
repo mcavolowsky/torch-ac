@@ -73,6 +73,7 @@ class WeightedPPOAlgo(PPOAlgo):
             self.mask = 1 - torch.tensor(done, device=self.device, dtype=torch.float)
             self.actions[i] = action
             self.values[i] = value
+            self.multi_values[i] = multi_value
             if self.reshape_reward is not None:
                 self.rewards[i] = torch.tensor([
                     self.reshape_reward(obs_, action_, reward_, done_)
@@ -205,9 +206,9 @@ class WeightedPPOAlgo(PPOAlgo):
                     # Compute loss
 
                     if self.acmodel.recurrent:
-                        dist, value, memory = self.acmodel(sb.obs, memory * sb.mask)
+                        dist, value, multi_value, memory = self.acmodel(sb.obs, memory * sb.mask, return_multi=True)
                     else:
-                        dist, value = self.acmodel(sb.obs)
+                        dist, value, multi_value = self.acmodel(sb.obs, return_multi=True)
 
                     entropy = dist.entropy().mean()
 
@@ -221,7 +222,10 @@ class WeightedPPOAlgo(PPOAlgo):
                     surr2 = (value_clipped - sb.returnn).pow(2)
                     value_loss = torch.max(surr1, surr2).mean()
 
-                    loss = policy_loss - self.entropy_coef * entropy + self.value_loss_coef * value_loss
+                    multi_value_loss = (multi_value - sb.multi_value).pow(2).mean()
+
+                    loss = policy_loss - self.entropy_coef * entropy + self.value_loss_coef * value_loss \
+                            + self.value_loss_coef * multi_value_loss
 
                     # Update batch values
 
